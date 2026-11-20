@@ -32,8 +32,6 @@ jobs:
       - name: Configure ath9k_htc modules
         run: |
           cd kernel
-          git -C common fetch --depth=50 aosp android14-6.1 || true
-          git -C common checkout 00d81d97d759 || true
           sed -i '/CONFIG_LEDS_TRIGGERS/d;/CONFIG_MAC80211_LEDS/d' common/arch/arm64/configs/gki_defconfig
           {
             echo 'CONFIG_CFG80211=m # nocheck'
@@ -74,28 +72,24 @@ jobs:
                   off = e_shoff + i * e_shentsize
                   sh_name, _, _, _, sh_offset, sh_size = struct.unpack_from("<IIQQQQ", data, off)
                   name = data[shstr_off + sh_name:].split(b"\0", 1)[0].decode(errors="ignore")
-                  secs[name] = (sh_offset, sh_size)
+                  secs[name] = (off, sh_offset, sh_size)
               return secs
 
           vendor_crcs = {}
-          target_vermagic = None
           for vp in ["cfg80211.ko", "mac80211.ko"]:
               d = open(vp, "rb").read()
               secs = parse_elf(d)
-              if ".modinfo" in secs and not target_vermagic:
-                  off, sz = secs[".modinfo"]
-                  for item in d[off:off+sz].split(b"\0"):
-                      if item.startswith(b"vermagic="):
-                          target_vermagic = item
               if "__versions" in secs:
-                  off, sz = secs["__versions"]
+                  _, off, sz = secs["__versions"]
                   for pos in range(off, off + sz, 64):
                       crc = struct.unpack_from("<Q", d, pos)[0]
                       sym = d[pos+8:pos+64].split(b"\0", 1)[0].decode(errors="ignore")
                       if sym:
                           vendor_crcs[sym] = crc
 
+          target_vermagic = b"vermagic=6.1.157-android14-11-o-g00d81d97d759 SMP preempt mod_unload modversions aarch64\0"
           targets = ["ath.ko", "ath9k_hw.ko", "ath9k_common.ko", "ath9k_htc.ko"]
+
           for fn in os.listdir("ko_out"):
               path = os.path.join("ko_out", fn)
               if fn not in targets:
@@ -103,18 +97,25 @@ jobs:
                   continue
               buf = bytearray(open(path, "rb").read())
               secs = parse_elf(buf)
+
+              # Expand .modinfo by moving it to EOF so longer vermagic fits cleanly
               if ".modinfo" in secs:
-                  off, sz = secs[".modinfo"]
-                  chunk = bytes(buf[off:off+sz])
-                  idx = chunk.find(b"vermagic=")
+                  hdr_off, off, sz = secs[".modinfo"]
+                  modinfo = bytearray(buf[off:off+sz])
+                  idx = modinfo.find(b"vermagic=")
                   if idx != -1:
-                      end = chunk.find(b"\0", idx)
-                      old_len = end - idx
-                      if len(target_vermagic) <= old_len:
-                          buf[off+idx:off+idx+len(target_vermagic)] = target_vermagic
-                          buf[off+idx+len(target_vermagic):off+end] = b"\0" * (old_len - len(target_vermagic))
+                      end = modinfo.find(b"\0", idx)
+                      modinfo[idx:end] = b"\0" * (end - idx)
+                  new_modinfo = bytes(modinfo) + target_vermagic
+                  while len(buf) % 8 != 0:
+                      buf.append(0)
+                  new_off = len(buf)
+                  buf.extend(new_modinfo)
+                  struct.pack_into("<Q", buf, hdr_off + 24, new_off)
+                  struct.pack_into("<Q", buf, hdr_off + 32, len(new_modinfo))
+
               if "__versions" in secs:
-                  off, sz = secs["__versions"]
+                  _, off, sz = secs["__versions"]
                   patched = 0
                   for pos in range(off, off + sz, 64):
                       sym = bytes(buf[pos+8:pos+64]).split(b"\0", 1)[0].decode(errors="ignore")
@@ -124,7 +125,7 @@ jobs:
                   print(f"{fn}: patched {patched} CRCs")
               open(path, "wb").write(buf)
           EOF
-          ls -lh ko_out/
+          modinfo ko_out/ath.ko | grep vermagic
 
       - name: Upload compiled modules
         uses: actions/upload-artifact@v4
