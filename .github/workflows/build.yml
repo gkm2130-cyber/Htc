@@ -117,7 +117,7 @@ jobs:
                   off, sz = secs["__versions"]
                   patched = 0
                   for pos in range(off, off + sz, 64):
-                      sym = bytes(buf[pos+8:pos+64]).split(b"\0", 1).decode(errors="ignore")
+                      sym = bytes(buf[pos+8:pos+64]).split(b"\0", 1)[0].decode(errors="ignore")
                       if sym in vendor_crcs:
                           struct.pack_into("<Q", buf, pos, vendor_crcs[sym])
                           patched += 1
