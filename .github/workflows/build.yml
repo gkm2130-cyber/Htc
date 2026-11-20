@@ -33,7 +33,7 @@ jobs:
           
           
           git -C common checkout 00d81d97d759 || true
-          {
+           {
             echo "CONFIG_RFKILL=m"
             echo "CONFIG_CFG80211=m"
             echo "CONFIG_MAC80211=m"
@@ -44,13 +44,15 @@ jobs:
             echo "CONFIG_ATH9K_HW=m"
             echo "CONFIG_ATH9K_COMMON=m"
             echo "CONFIG_ATH9K_HTC=m"
-          } >> common/arch/arm64/configs/gki_defconfig
-          sed -i 's/CONFIG_TRIM_UNUSED_KSYMS=y/# CONFIG_TRIM_UNUSED_KSYMS is not set/' common/arch/arm64/configs/gki_defconfig
+            echo "# CONFIG_TRIM_UNUSED_KSYMS is not set"
+          } > common/ath9k.fragment
+          echo 'exports_files(["ath9k.fragment"])' >> common/BUILD.bazel
 
       - name: Build kernel modules with Bazel
         run: |
           cd kernel
-          tools/bazel build --allow_undeclared_modules //common:kernel_aarch64_dist
+          tools/bazel build --verbose_failures --allow_undeclared_modules --defconfig_fragment=//common:ath9k.fragment //common:kernel_aarch64_dist
+         
           mkdir -p ../ko_out
           find out/ bazel-bin/ -type f \( -name "rfkill.ko" -o -name "cfg80211.ko" -o -name "mac80211.ko" -o -name "ath.ko" -o -name "ath9k_hw.ko" -o -name "ath9k_common.ko" -o -name "ath9k_htc.ko" \) -exec cp {} ../ko_out/ \;
           ls -lh ../ko_out
