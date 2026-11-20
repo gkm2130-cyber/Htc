@@ -37,15 +37,16 @@ jobs:
             echo 'CONFIG_CFG80211=m # nocheck'
             echo 'CONFIG_CFG80211_WEXT=y # nocheck'
             echo 'CONFIG_MAC80211=m # nocheck'
-            echo '# CONFIG_MAC80211_LEDS is not set'
+            echo 'CONFIG_MAC80211_LEDS=y # nocheck'
             echo 'CONFIG_WLAN=y # nocheck'
             echo 'CONFIG_WLAN_VENDOR_ATH=y # nocheck'
-            echo 'CONFIG_ATH_CARDS=m # nocheck'
+            echo 'CONFIG_ATH_CARDS=y # nocheck'
             echo 'CONFIG_ATH_COMMON=m # nocheck'
             echo 'CONFIG_ATH9K_HW=m # nocheck'
             echo 'CONFIG_ATH9K_COMMON=m # nocheck'
             echo 'CONFIG_ATH9K_HTC=m # nocheck'
-            echo '# CONFIG_ATH9K_HTC_DEBUGFS is not set'
+            echo '# CONFIG_ATH9K_HTC_DEBUGFS is not set # nocheck'
+            
           } > common/ath9k.fragment
           
           
