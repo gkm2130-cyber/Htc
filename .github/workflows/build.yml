@@ -7,6 +7,9 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Maximize runner disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -30,10 +33,9 @@ jobs:
         run: |
           cd kernel
           git -C common fetch --depth=50 aosp android14-6.1 || true
-        
-          
           git -C common checkout 00d81d97d759 || true
-                     {
+          sed -i '/CONFIG_LEDS_TRIGGERS/d;/CONFIG_MAC80211_LEDS/d' common/arch/arm64/configs/gki_defconfig
+          {
             echo 'CONFIG_CFG80211=m # nocheck'
             echo 'CONFIG_CFG80211_WEXT=y # nocheck'
             echo 'CONFIG_MAC80211=m # nocheck'
@@ -48,23 +50,85 @@ jobs:
             echo 'CONFIG_ATH9K_HTC=m # nocheck'
             echo '# CONFIG_ATH9K_HTC_DEBUGFS is not set # nocheck'
           } > common/ath9k.fragment
-          
-          
-          
           echo 'exports_files(["ath9k.fragment"])' >> common/BUILD.bazel
 
       - name: Build kernel modules with Bazel
         run: |
           cd kernel
-                    mkdir -p ../ko_out
+          mkdir -p ../ko_out
           tools/bazel run --verbose_failures --notrim --allow_undeclared_modules --defconfig_fragment=//common:ath9k.fragment //common:kernel_aarch64_dist -- --dist_dir="$(realpath ../ko_out)"
           find -L out/ -type f \( -name "ath.ko" -o -name "ath9k_hw.ko" -o -name "ath9k_common.ko" -o -name "ath9k_htc.ko" \) -exec cp -v {} ../ko_out/ \;
           ls -lh ../ko_out/ath*
-          
-          
+
+      - name: Patch vermagic and symbol CRCs
+        run: |
+          python3 - << 'EOF'
+          import struct, os
+
+          def parse_elf(data):
+              e_shoff = struct.unpack_from("<Q", data, 40)[0]
+              e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", data, 58)
+              shstr_off = struct.unpack_from("<Q", data, e_shoff + e_shstrndx * e_shentsize + 24)[0]
+              secs = {}
+              for i in range(e_shnum):
+                  off = e_shoff + i * e_shentsize
+                  sh_name, _, _, _, sh_offset, sh_size = struct.unpack_from("<IIQQQQ", data, off)
+                  name = data[shstr_off + sh_name:].split(b"\0", 1)[0].decode(errors="ignore")
+                  secs[name] = (sh_offset, sh_size)
+              return secs
+
+          vendor_crcs = {}
+          target_vermagic = None
+          for vp in ["cfg80211.ko", "mac80211.ko"]:
+              d = open(vp, "rb").read()
+              secs = parse_elf(d)
+              if ".modinfo" in secs and not target_vermagic:
+                  off, sz = secs[".modinfo"]
+                  for item in d[off:off+sz].split(b"\0"):
+                      if item.startswith(b"vermagic="):
+                          target_vermagic = item
+              if "__versions" in secs:
+                  off, sz = secs["__versions"]
+                  for pos in range(off, off + sz, 64):
+                      crc = struct.unpack_from("<Q", d, pos)[0]
+                      sym = d[pos+8:pos+64].split(b"\0", 1)[0].decode(errors="ignore")
+                      if sym:
+                          vendor_crcs[sym] = crc
+
+          targets = ["ath.ko", "ath9k_hw.ko", "ath9k_common.ko", "ath9k_htc.ko"]
+          for fn in os.listdir("ko_out"):
+              path = os.path.join("ko_out", fn)
+              if fn not in targets:
+                  os.remove(path)
+                  continue
+              buf = bytearray(open(path, "rb").read())
+              secs = parse_elf(buf)
+              if ".modinfo" in secs:
+                  off, sz = secs[".modinfo"]
+                  chunk = bytes(buf[off:off+sz])
+                  idx = chunk.find(b"vermagic=")
+                  if idx != -1:
+                      end = chunk.find(b"\0", idx)
+                      old_len = end - idx
+                      if len(target_vermagic) <= old_len:
+                          buf[off+idx:off+idx+len(target_vermagic)] = target_vermagic
+                          buf[off+idx+len(target_vermagic):off+end] = b"\0" * (old_len - len(target_vermagic))
+              if "__versions" in secs:
+                  off, sz = secs["__versions"]
+                  patched = 0
+                  for pos in range(off, off + sz, 64):
+                      sym = bytes(buf[pos+8:pos+64]).split(b"\0", 1).decode(errors="ignore")
+                      if sym in vendor_crcs:
+                          struct.pack_into("<Q", buf, pos, vendor_crcs[sym])
+                          patched += 1
+                  print(f"{fn}: patched {patched} CRCs")
+              open(path, "wb").write(buf)
+          EOF
+          ls -lh ko_out/
 
       - name: Upload compiled modules
         uses: actions/upload-artifact@v4
         with:
           name: ar9271-ko-modules
           path: ko_out/*.ko
+          
