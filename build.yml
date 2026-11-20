@@ -1,0 +1,60 @@
+name: Build AR9271 GKI Modules
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Maximize runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Install dependencies and repo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl python3 repo build-essential bc bison flex libssl-dev rsync zip
+
+      - name: Sync android14-6.1 GKI kernel source
+        run: |
+          git config --global user.name "Builder"
+          git config --global user.email "builder@example.com"
+          mkdir kernel && cd kernel
+          URL=$(echo "aHR0cHM6Ly9hbmRyb2lkLmdvb2dsZXNvdXJjZS5jb20va2VybmVsL21hbmlmZXN0" | base64 -d)
+          repo init -u "$URL" -b common-android14-6.1 --depth=1
+          repo sync -c -j$(nproc)
+
+      - name: Configure ath9k_htc modules
+        run: |
+          cd kernel
+          git -C common fetch --depth=50 origin android14-6.1
+          git -C common checkout 00d81d97d759 || true
+          {
+            echo "CONFIG_RFKILL=m"
+            echo "CONFIG_CFG80211=m"
+            echo "CONFIG_MAC80211=m"
+            echo "CONFIG_WLAN=y"
+            echo "CONFIG_WLAN_VENDOR_ATH=y"
+            echo "CONFIG_ATH_CARDS=m"
+            echo "CONFIG_ATH_COMMON=m"
+            echo "CONFIG_ATH9K_HW=m"
+            echo "CONFIG_ATH9K_COMMON=m"
+            echo "CONFIG_ATH9K_HTC=m"
+          } >> common/arch/arm64/configs/gki_defconfig
+          sed -i 's/CONFIG_TRIM_UNUSED_KSYMS=y/# CONFIG_TRIM_UNUSED_KSYMS is not set/' common/arch/arm64/configs/gki_defconfig
+
+      - name: Build kernel modules with Bazel
+        run: |
+          cd kernel
+          tools/bazel build --allow_undeclared_modules //common:kernel_aarch64_dist
+          mkdir -p ../ko_out
+          find out/ bazel-bin/ -type f \( -name "rfkill.ko" -o -name "cfg80211.ko" -o -name "mac80211.ko" -o -name "ath.ko" -o -name "ath9k_hw.ko" -o -name "ath9k_common.ko" -o -name "ath9k_htc.ko" \) -exec cp {} ../ko_out/ \;
+          ls -lh ../ko_out
+
+      - name: Upload compiled modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: ar9271-ko-modules
+          path: ko_out/*.ko
