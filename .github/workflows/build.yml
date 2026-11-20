@@ -56,14 +56,15 @@ jobs:
         run: |
           cd kernel
                     tools/bazel build --verbose_failures --notrim --allow_undeclared_modules --defconfig_fragment=//common:ath9k.fragment //common:kernel_aarch64_dist
-                    
-         
-                     mkdir -p ../ko_out
-          DIST_DIR="out/bazel-bin/common/kernel_aarch64_dist"
+                    mkdir -p ../ko_out
+          SRC_DIR=$(find out/bazel-bin/common -name "ath9k_htc.ko" -printf '%h\n' | head -n 1)
+          echo "Found modules in: $SRC_DIR"
           for mod in rfkill.ko cfg80211.ko mac80211.ko ath.ko ath9k_hw.ko ath9k_common.ko ath9k_htc.ko; do
-            [ -f "$DIST_DIR/$mod" ] && cp -v "$DIST_DIR/$mod" ../ko_out/
+            FOUND=$(find out/bazel-bin/common -name "$mod" | head -n 1)
+            [ -n "$FOUND" ] && cp -v "$FOUND" ../ko_out/
           done
           ls -lh ../ko_out
+          
           
 
       - name: Upload compiled modules
