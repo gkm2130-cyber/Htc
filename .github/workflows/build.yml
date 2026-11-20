@@ -29,7 +29,9 @@ jobs:
       - name: Configure ath9k_htc modules
         run: |
           cd kernel
-          git -C common fetch --depth=50 origin android14-6.1
+          git -C common fetch --depth=50 aosp android14-6.1 || true
+          
+          
           git -C common checkout 00d81d97d759 || true
           {
             echo "CONFIG_RFKILL=m"
