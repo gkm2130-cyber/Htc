@@ -86,7 +86,7 @@ jobs:
                   for pos in range(sym_off, sym_off + sym_sz, 24):
                       st_name, st_info, st_other, st_shndx, st_value, st_size = struct.unpack_from("<IBBHQQ", d, pos)
                       if st_name:
-                          name = d[str_off + st_name:].split(b"\0", 1)[0].decode(errors="ignore")
+                          name = d[str_off + st_name:].split(b"\0", 1).decode(errors="ignore")
                           if name.startswith("__crc_"):
                               crc_map[name[6:]] = st_value & 0xffffffff
 
@@ -160,3 +160,4 @@ jobs:
         with:
           name: ar9271-ko-modules
           path: ko_out/*.ko
+          
