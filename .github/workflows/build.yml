@@ -57,7 +57,7 @@ jobs:
           tools/bazel run --verbose_failures --notrim --allow_undeclared_modules --defconfig_fragment=//common:ath9k.fragment //common:kernel_aarch64_dist -- --dist_dir="$(realpath ../ko_out)"
           find -L out/ -type f \( -name "ath.ko" -o -name "ath9k_hw.ko" -o -name "ath9k_common.ko" -o -name "ath9k_htc.ko" \) -exec cp -v {} ../ko_out/ \;
 
-      - name: Patch vermagic and exported vendor CRCs
+      - name: Patch vermagic and exact vendor symbol CRCs
         run: |
           python3 - << 'EOF'
           import struct, os
@@ -74,62 +74,47 @@ jobs:
                   secs[name] = (off, sh_offset, sh_size)
               return secs
 
-          def extract_exported_crcs(ko_path):
+          def read_vendor_sym_crcs(ko_path):
               d = open(ko_path, "rb").read()
               secs = parse_elf(d)
-              crcs = {}
-              # Map __ksymtab + __kcrctab and __ksymtab_gpl + __kcrctab_gpl (12-byte PREL32 entries, 4-byte u32 CRCs)
+              crc_map = {}
+
+              # Check ELF symbol table for __crc_* symbols first
+              if ".symtab" in secs and ".strtab" in secs:
+                  _, sym_off, sym_sz = secs[".symtab"]
+                  _, str_off, str_sz = secs[".strtab"]
+                  for pos in range(sym_off, sym_off + sym_sz, 24):
+                      st_name, st_info, st_other, st_shndx, st_value, st_size = struct.unpack_from("<IBBHQQ", d, pos)
+                      if st_name:
+                          name = d[str_off + st_name:].split(b"\0", 1)[0].decode(errors="ignore")
+                          if name.startswith("__crc_"):
+                              crc_map[name[6:]] = st_value & 0xffffffff
+
+              # Resolve PREL32 __ksymtab / __ksymtab_gpl entries paired with __kcrctab / __kcrctab_gpl
               for ktab, ctab in [("__ksymtab", "__kcrctab"), ("__ksymtab_gpl", "__kcrctab_gpl")]:
-                  if ktab in secs and ctab in secs and "__ksymtab_strings" in secs:
+                  if ktab in secs and ctab in secs:
                       _, koff, ksz = secs[ktab]
                       _, coff, csz = secs[ctab]
-                      _, soff, ssz = secs["__ksymtab_strings"]
-                      n = min(ksz // 12, csz // 4)
-                      # Build ordered list of symbol names from __ksymtab_strings matching exported count
-                      raw_strs = [s.decode(errors="ignore") for s in d[soff:soff+ssz].split(b"\0") if s]
-                      # Also check ELF symtab for any __crc_ symbols
-              # Direct scan: pair ordered __ksymtab_strings entries with __kcrctab + __kcrctab_gpl
-              if "__ksymtab_strings" in secs:
-                  _, soff, ssz = secs["__ksymtab_strings"]
-                  syms = [s.decode(errors="ignore") for s in d[soff:soff+ssz].split(b"\0") if s]
-                  vals = []
-                  for ctab in ["__kcrctab", "__kcrctab_gpl"]:
-                      if ctab in secs:
-                          _, coff, csz = secs[ctab]
-                          vals.extend(struct.unpack_from(f"<{csz//4}I", d, coff))
-                  # Note: __ksymtab is sorted alphabetically by linker, __ksymtab_gpl is sorted alphabetically by linker!
-                  gpl_count = (secs["__kcrctab_gpl"][2] // 4) if "__kcrctab_gpl" in secs else 0
-                  std_count = (secs["__kcrctab"][2] // 4) if "__kcrctab" in secs else 0
-                  # Match by comparing against Bazel's identical module symbol order!
-                  return syms, vals
-              return [], []
+                      count = min(ksz // 12, csz // 4)
+                      for idx in range(count):
+                          entry_pos = koff + idx * 12
+                          _, name_rel, _ = struct.unpack_from("<iii", d, entry_pos)
+                          name_file_pos = (entry_pos + 4) + name_rel
+                          if 0 <= name_file_pos < len(d):
+                              sym = d[name_file_pos:].split(b"\0", 1)[0].decode(errors="ignore")
+                              crc = struct.unpack_from("<I", d, coff + idx * 4)[0]
+                              if sym and sym.isidentifier():
+                                  crc_map[sym] = crc
+              return crc_map
 
-          # Even simpler and 100% exact: pair vendor __kcrctab values directly with Bazel's identical cfg80211.ko / mac80211.ko!
           vendor_crcs = {}
           for vp in ["cfg80211.ko", "mac80211.ko"]:
-              bp = os.path.join("ko_out", vp)
-              if not os.path.exists(bp):
-                  continue
-              vd = open(vp, "rb").read()
-              bd = open(bp, "rb").read()
-              vsecs = parse_elf(vd)
-              bsecs = parse_elf(bd)
-              # Read Bazel's exported CRCs from nm -g or __kcrctab and map index-by-index!
-              for ctab in ["__kcrctab", "__kcrctab_gpl"]:
-                  if ctab in vsecs and ctab in bsecs:
-                      _, voff, vsz = vsecs[ctab]
-                      _, boff, bsz = bsecs[ctab]
-                      vvals = struct.unpack_from(f"<{vsz//4}I", vd, voff)
-                      bvals = struct.unpack_from(f"<{bsz//4}I", bd, boff)
-                      # Map Bazel CRC -> Vendor CRC (1-to-1 bijection of identical symbol tables!)
-                      if len(vvals) == len(bvals):
-                          for bv, vv in zip(bvals, vvals):
-                              vendor_crcs[bv] = vv
-                          print(f"{vp} {ctab}: mapped {len(vvals)} CRCs 1-to-1!")
-                      else:
-                          print(f"{vp} {ctab}: count mismatch vendor={len(vvals)} vs bazel={len(bvals)}")
+              extracted = read_vendor_sym_crcs(vp)
+              print(f"{vp}: extracted {len(extracted)} symbol CRCs")
+              vendor_crcs.update(extracted)
 
-          print("Total mapped CRC pairs:", len(vendor_crcs))
+          for check_sym in ["wiphy_apply_custom_regulatory", "ieee80211_get_channel_khz", "freq_reg_info"]:
+              print(f"Verify {check_sym}:", hex(vendor_crcs[check_sym]) if check_sym in vendor_crcs else "MISSING")
 
           target_vermagic = b"vermagic=6.1.157-android14-11-o-g00d81d97d759 SMP preempt mod_unload modversions aarch64\0"
           targets = ["ath.ko", "ath9k_hw.ko", "ath9k_common.ko", "ath9k_htc.ko"]
@@ -161,20 +146,17 @@ jobs:
                   _, off, sz = secs["__versions"]
                   patched = 0
                   for pos in range(off, off + sz, 64):
-                      old_crc = struct.unpack_from("<Q", buf, pos)[0] & 0xffffffff
                       sym = bytes(buf[pos+8:pos+64]).split(b"\0", 1)[0].decode(errors="ignore")
-                      if old_crc in vendor_crcs:
-                          struct.pack_into("<Q", buf, pos, vendor_crcs[old_crc])
+                      if sym in vendor_crcs:
+                          struct.pack_into("<Q", buf, pos, vendor_crcs[sym])
                           patched += 1
-                          print(f"  {fn}: {sym} 0x{old_crc:08x} -> 0x{vendor_crcs[old_crc]:08x}")
                   print(f"{fn}: patched {patched} CRCs")
               open(path, "wb").write(buf)
           EOF
-          modprobe --dump-modversions ko_out/ath.ko | grep wiphy_apply_custom_regulatory
+          modprobe --dump-modversions ko_out/ath.ko | grep -E "wiphy_apply_custom_regulatory|ieee80211_get_channel_khz|freq_reg_info"
 
       - name: Upload compiled modules
         uses: actions/upload-artifact@v4
         with:
           name: ar9271-ko-modules
           path: ko_out/*.ko
-          
