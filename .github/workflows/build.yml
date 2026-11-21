@@ -59,7 +59,7 @@ jobs:
 
       - name: Patch vermagic and exact vendor symbol CRCs
         run: |
-          python3 - << 'EOF'
+          python3 - << 'PYEOF'
           import struct, os
 
           def read_cstr(data, offset):
@@ -85,16 +85,27 @@ jobs:
               secs = parse_elf(d)
               crc_map = {}
 
-              if ".symtab" in secs and ".strtab" in secs:
-                  _, sym_off, sym_sz = secs.get(".symtab")
-                  _, str_off, str_sz = secs.get(".strtab")
-                  for pos in range(sym_off, sym_off + sym_sz, 24):
-                      st_name, st_info, st_other, st_shndx, st_value, st_size = struct.unpack_from("<IBBHQQ", d, pos)
-                      if st_name:
-                          name = read_cstr(d, str_off + st_name)
-                          if name.startswith("__crc_"):
-                              crc_map[name[6:]] = st_value & 0xffffffff
+              # 1. Read .rela__ksymtab and .rela__ksymtab_gpl (Elf64_Rela: r_offset(Q), r_info(Q), r_addend(q))
+              if "__ksymtab_strings" in secs:
+                  _, str_off, str_sz = secs.get("__ksymtab_strings")
+                  for ktab, rtab, ctab in [
+                      ("__ksymtab", ".rela__ksymtab", "__kcrctab"),
+                      ("__ksymtab_gpl", ".rela__ksymtab_gpl", "__kcrctab_gpl"),
+                  ]:
+                      if rtab in secs and ctab in secs:
+                          _, roff, rsz = secs.get(rtab)
+                          _, coff, csz = secs.get(ctab)
+                          for pos in range(roff, roff + rsz, 24):
+                              r_offset, r_info, r_addend = struct.unpack_from("<QQq", d, pos)
+                              if r_offset % 12 == 4:
+                                  idx = r_offset // 12
+                                  if idx * 4 + 4 <= csz and 0 <= r_addend < str_sz:
+                                      sym = read_cstr(d, str_off + r_addend)
+                                      crc, = struct.unpack_from("<I", d, coff + idx * 4)
+                                      if sym and sym.isidentifier():
+                                          crc_map[sym] = crc
 
+              # 2. Fallback: direct PREL32 if un-relocated
               for ktab, ctab in [("__ksymtab", "__kcrctab"), ("__ksymtab_gpl", "__kcrctab_gpl")]:
                   if ktab in secs and ctab in secs:
                       _, koff, ksz = secs.get(ktab)
@@ -107,7 +118,7 @@ jobs:
                           if 0 <= name_file_pos < len(d):
                               sym = read_cstr(d, name_file_pos)
                               crc, = struct.unpack_from("<I", d, coff + idx * 4)
-                              if sym and sym.isidentifier():
+                              if sym and sym.isidentifier() and sym not in crc_map:
                                   crc_map[sym] = crc
               return crc_map
 
@@ -120,6 +131,7 @@ jobs:
           for check_sym in ["wiphy_apply_custom_regulatory", "ieee80211_get_channel_khz", "freq_reg_info"]:
               val = vendor_crcs.get(check_sym)
               print(f"Verify {check_sym}:", hex(val) if val is not None else "MISSING")
+              assert val is not None, f"Failed to extract CRC for {check_sym}"
 
           target_vermagic = b"vermagic=6.1.157-android14-11-o-g00d81d97d759 SMP preempt mod_unload modversions aarch64\0"
           targets = {"ath.ko", "ath9k_hw.ko", "ath9k_common.ko", "ath9k_htc.ko"}
@@ -157,7 +169,7 @@ jobs:
                           patched += 1
                   print(f"{fn}: patched {patched} CRCs")
               open(path, "wb").write(buf)
-          EOF
+          PYEOF
           modprobe --dump-modversions ko_out/ath.ko | grep -E "wiphy_apply_custom_regulatory|ieee80211_get_channel_khz|freq_reg_info"
 
       - name: Upload compiled modules
