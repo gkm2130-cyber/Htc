@@ -18,7 +18,7 @@ jobs:
       - name: Install dependencies and repo
         run: |
           sudo apt-get update
-          sudo apt-get install -y git curl python3 repo build-essential bc bison flex libssl-dev rsync zip
+          sudo apt-get install -y git curl python3 repo build-essential bc bison flex libssl-dev rsync zip binutils
 
       - name: Sync android14-6.1 GKI kernel source
         run: |
@@ -56,12 +56,23 @@ jobs:
           mkdir -p ../ko_out
           tools/bazel run --verbose_failures --notrim --allow_undeclared_modules --defconfig_fragment=//common:ath9k.fragment //common:kernel_aarch64_dist -- --dist_dir="$(realpath ../ko_out)"
           find -L out/ -type f \( -name "ath.ko" -o -name "ath9k_hw.ko" -o -name "ath9k_common.ko" -o -name "ath9k_htc.ko" \) -exec cp -v {} ../ko_out/ \;
-          ls -lh ../ko_out/ath*
 
-      - name: Patch vermagic and symbol CRCs
+      - name: Patch vermagic and exported vendor CRCs
         run: |
+          nm -g cfg80211.ko mac80211.ko | grep " __crc_" > exported_crcs.txt
+          grep "wiphy_apply_custom_regulatory" exported_crcs.txt
           python3 - << 'EOF'
           import struct, os
+
+          vendor_crcs = {}
+          with open("exported_crcs.txt") as f:
+              for line in f:
+                  parts = line.strip().split()
+                  if len(parts) == 3 and parts[2].startswith("__crc_"):
+                      sym = parts[2][6:]
+                      vendor_crcs[sym] = int(parts[0], 16) & 0xffffffff
+
+          print("Loaded exported vendor CRCs:", len(vendor_crcs))
 
           def parse_elf(data):
               e_shoff = struct.unpack_from("<Q", data, 40)[0]
@@ -75,18 +86,6 @@ jobs:
                   secs[name] = (off, sh_offset, sh_size)
               return secs
 
-          vendor_crcs = {}
-          for vp in ["cfg80211.ko", "mac80211.ko"]:
-              d = open(vp, "rb").read()
-              secs = parse_elf(d)
-              if "__versions" in secs:
-                  _, off, sz = secs["__versions"]
-                  for pos in range(off, off + sz, 64):
-                      crc = struct.unpack_from("<Q", d, pos)[0]
-                      sym = d[pos+8:pos+64].split(b"\0", 1)[0].decode(errors="ignore")
-                      if sym:
-                          vendor_crcs[sym] = crc
-
           target_vermagic = b"vermagic=6.1.157-android14-11-o-g00d81d97d759 SMP preempt mod_unload modversions aarch64\0"
           targets = ["ath.ko", "ath9k_hw.ko", "ath9k_common.ko", "ath9k_htc.ko"]
 
@@ -98,7 +97,6 @@ jobs:
               buf = bytearray(open(path, "rb").read())
               secs = parse_elf(buf)
 
-              # Expand .modinfo by moving it to EOF so longer vermagic fits cleanly
               if ".modinfo" in secs:
                   hdr_off, off, sz = secs[".modinfo"]
                   modinfo = bytearray(buf[off:off+sz])
@@ -125,7 +123,7 @@ jobs:
                   print(f"{fn}: patched {patched} CRCs")
               open(path, "wb").write(buf)
           EOF
-          modinfo ko_out/ath.ko | grep vermagic
+          modprobe --dump-modversions ko_out/ath.ko | grep wiphy_apply_custom_regulatory
 
       - name: Upload compiled modules
         uses: actions/upload-artifact@v4
