@@ -75,20 +75,24 @@ jobs:
               secs = dict()
               for i in range(e_shnum):
                   off = e_shoff + i * e_shentsize
-                  sh_name, _, _, _, sh_offset, sh_size = struct.unpack_from("<IIQQQQ", data, off)
+                  sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size = struct.unpack_from("<IIQQQQ", data, off)
                   name = read_cstr(data, shstr_off + sh_name)
-                  secs[name] = (off, sh_offset, sh_size)
+                  secs[name] = (off, sh_offset, sh_size, sh_addr)
               return secs
 
           def get_vermagic(ko_path):
               d = open(ko_path, "rb").read()
               secs = parse_elf(d)
-              _, off, sz = secs[".modinfo"]
+              _, off, sz, _ = secs[".modinfo"]
               modinfo = d[off:off+sz]
               idx = modinfo.find(b"vermagic=")
               assert idx != -1, f"vermagic not found in {ko_path}"
               end = modinfo.find(b"\0", idx)
               return modinfo[idx:end+1]
+
+          def prel31_to_addr(place_addr, val):
+              offset = ((val & 0x7fffffff) ^ 0x40000000) - 0x40000000
+              return place_addr + offset
 
           def read_vendor_sym_crcs(ko_path):
               d = open(ko_path, "rb").read()
@@ -97,8 +101,8 @@ jobs:
 
               symtab = list()
               if ".symtab" in secs and ".strtab" in secs:
-                  _, sym_off, sym_sz = secs.get(".symtab")
-                  _, str_off, _ = secs.get(".strtab")
+                  _, sym_off, sym_sz, _ = secs[".symtab"]
+                  _, str_off, _, _ = secs[".strtab"]
                   for pos in range(sym_off, sym_off + sym_sz, 24):
                       st_name, st_info, st_other, st_shndx, st_value, st_size = struct.unpack_from("<IBBHQQ", d, pos)
                       name = read_cstr(d, str_off + st_name) if st_name else ""
@@ -106,12 +110,29 @@ jobs:
                       if name.startswith("__crc_"):
                           crc_map[name[6:]] = st_value & 0xffffffff
 
-              if "__ksymtab_strings" in secs and symtab:
-                  _, sstr_off, sstr_sz = secs.get("__ksymtab_strings")
+              if "__ksymtab_strings" in secs:
+                  _, sstr_off, sstr_sz, sstr_addr = secs["__ksymtab_strings"]
+                  for ktab, ctab in [("__ksymtab", "__kcrctab"), ("__ksymtab_gpl", "__kcrctab_gpl")]:
+                      if ktab in secs and ctab in secs:
+                          _, koff, ksz, kaddr = secs[ktab]
+                          _, coff, csz, _ = secs[ctab]
+                          num_entries = min(ksz // 12, csz // 4)
+                          for i in range(num_entries):
+                              entry_off = koff + i * 12
+                              entry_addr = kaddr + i * 12
+                              _, name_prel, _ = struct.unpack_from("<III", d, entry_off)
+                              target_addr = prel31_to_addr(entry_addr + 4, name_prel)
+                              str_off_in_sec = target_addr - sstr_addr
+                              if 0 <= str_off_in_sec < sstr_sz:
+                                  sym = read_cstr(d, sstr_off + str_off_in_sec)
+                                  crc, = struct.unpack_from("<I", d, coff + i * 4)
+                                  if sym and sym.isidentifier():
+                                      crc_map[sym] = crc
+
                   for rtab, ctab in [(".rela__ksymtab", "__kcrctab"), (".rela__ksymtab_gpl", "__kcrctab_gpl")]:
-                      if rtab in secs and ctab in secs:
-                          _, roff, rsz = secs.get(rtab)
-                          _, coff, csz = secs.get(ctab)
+                      if rtab in secs and ctab in secs and symtab:
+                          _, roff, rsz, _ = secs[rtab]
+                          _, coff, csz, _ = secs[ctab]
                           for pos in range(roff, roff + rsz, 24):
                               r_offset, r_info, r_addend = struct.unpack_from("<QQq", d, pos)
                               if r_offset % 12 == 4:
@@ -152,7 +173,7 @@ jobs:
               secs = parse_elf(buf)
 
               if ".modinfo" in secs:
-                  hdr_off, off, sz = secs.get(".modinfo")
+                  hdr_off, off, sz, _ = secs[".modinfo"]
                   entries = [e for e in bytes(buf[off:off+sz]).split(b"\0") if e and not e.startswith(b"vermagic=")]
                   new_modinfo = b"\0".join(entries) + b"\0" + target_vermagic
                   while len(buf) % 8 != 0:
@@ -163,12 +184,16 @@ jobs:
                   struct.pack_into("<Q", buf, hdr_off + 32, len(new_modinfo))
 
               if "__versions" in secs:
-                  _, off, sz = secs.get("__versions")
+                  _, off, sz, _ = secs["__versions"]
                   patched = 0
                   for pos in range(off, off + sz, 64):
                       sym = read_cstr(bytes(buf[pos+8:pos+64]), 0)
                       if sym in vendor_crcs:
-                          struct.pack_into("<Q", buf, pos, vendor_crcs.get(sym))
+                          old_crc, = struct.unpack_from("<Q", buf, pos)
+                          new_crc = vendor_crcs[sym]
+                          struct.pack_into("<Q", buf, pos, new_crc)
+                          if old_crc != new_crc:
+                              print(f"  {fn}: updated {sym} CRC {hex(old_crc)} -> {hex(new_crc)}")
                           patched += 1
                   print(f"{fn}: patched {patched} CRCs")
               open(path, "wb").write(buf)
@@ -178,5 +203,3 @@ jobs:
       - name: Upload compiled modules
         uses: actions/upload-artifact@v4
         with:
-          name: ar9271-ko-modules
-          path: ko_out/*.ko
