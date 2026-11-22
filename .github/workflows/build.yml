@@ -98,6 +98,13 @@ jobs:
               secs = parse_elf(d)
               crc_map = dict()
 
+              def read_u32_at_vaddr(vaddr):
+                  for _, s_off, s_sz, s_addr in secs.values():
+                      if s_addr <= vaddr <= s_addr + s_sz - 4:
+                          val, = struct.unpack_from("<I", d, s_off + (vaddr - s_addr))
+                          return val
+                  return None
+
               symtab = list()
               if ".symtab" in secs and ".strtab" in secs:
                   _, sym_off, sym_sz, _ = secs[".symtab"]
@@ -114,7 +121,7 @@ jobs:
                   for ktab, ctab in [("__ksymtab", "__kcrctab"), ("__ksymtab_gpl", "__kcrctab_gpl")]:
                       if ktab in secs and ctab in secs:
                           _, koff, ksz, kaddr = secs[ktab]
-                          _, coff, csz, _ = secs[ctab]
+                          _, coff, csz, caddr = secs[ctab]
                           num_entries = min(ksz // 12, csz // 4)
                           for i in range(num_entries):
                               entry_off = koff + i * 12
@@ -124,7 +131,10 @@ jobs:
                               str_off_in_sec = target_addr - sstr_addr
                               if 0 <= str_off_in_sec < sstr_sz:
                                   sym = read_cstr(d, sstr_off + str_off_in_sec)
-                                  crc, = struct.unpack_from("<I", d, coff + i * 4)
+                                  raw_crc, = struct.unpack_from("<I", d, coff + i * 4)
+                                  crc_addr = prel31_to_addr(caddr + i * 4, raw_crc)
+                                  deref_crc = read_u32_at_vaddr(crc_addr)
+                                  crc = deref_crc if deref_crc is not None else raw_crc
                                   if sym and sym.isidentifier():
                                       crc_map[sym] = crc
                   for rtab, ctab in [(".rela__ksymtab", "__kcrctab"), (".rela__ksymtab_gpl", "__kcrctab_gpl")]:
