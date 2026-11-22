@@ -61,7 +61,6 @@ jobs:
         run: |
           python3 - << 'PYEOF'
           import struct, os
-
           def read_cstr(data, offset):
               end = data.find(b"\0", offset)
               if end == -1:
@@ -128,7 +127,6 @@ jobs:
                                   crc, = struct.unpack_from("<I", d, coff + i * 4)
                                   if sym and sym.isidentifier():
                                       crc_map[sym] = crc
-
                   for rtab, ctab in [(".rela__ksymtab", "__kcrctab"), (".rela__ksymtab_gpl", "__kcrctab_gpl")]:
                       if rtab in secs and ctab in secs and symtab:
                           _, roff, rsz, _ = secs[rtab]
