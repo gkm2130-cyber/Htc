@@ -80,6 +80,16 @@ jobs:
                   secs[name] = (off, sh_offset, sh_size)
               return secs
 
+          def get_vermagic(ko_path):
+              d = open(ko_path, "rb").read()
+              secs = parse_elf(d)
+              _, off, sz = secs[".modinfo"]
+              modinfo = d[off:off+sz]
+              idx = modinfo.find(b"vermagic=")
+              assert idx != -1, f"vermagic not found in {ko_path}"
+              end = modinfo.find(b"\0", idx)
+              return modinfo[idx:end+1]
+
           def read_vendor_sym_crcs(ko_path):
               d = open(ko_path, "rb").read()
               secs = parse_elf(d)
@@ -117,18 +127,20 @@ jobs:
                                               crc_map[sym] = crc
               return crc_map
 
+          target_vermagic = get_vermagic("cfg80211.ko")
+          print("Auto-detected vermagic:", target_vermagic.decode().strip("\0"))
+
           vendor_crcs = dict()
           for vp in ["cfg80211.ko", "mac80211.ko"]:
               extracted = read_vendor_sym_crcs(vp)
               print(f"{vp}: extracted {len(extracted)} symbol CRCs")
               vendor_crcs.update(extracted)
 
-          for check_sym in ["wiphy_apply_custom_regulatory", "ieee80211_get_channel_khz", "freq_reg_info"]:
+          for check_sym in ["reg_initiator_name", "wiphy_apply_custom_regulatory", "ieee80211_get_channel_khz", "freq_reg_info"]:
               val = vendor_crcs.get(check_sym)
               print(f"Verify {check_sym}:", hex(val) if val is not None else "MISSING")
               assert val is not None, f"Failed to extract CRC for {check_sym}"
 
-          target_vermagic = b"vermagic=6.1.157-android14-11-o-g00d81d97d759 SMP preempt mod_unload modversions aarch64\0"
           targets = {"ath.ko", "ath9k_hw.ko", "ath9k_common.ko", "ath9k_htc.ko"}
 
           for fn in os.listdir("ko_out"):
@@ -141,12 +153,8 @@ jobs:
 
               if ".modinfo" in secs:
                   hdr_off, off, sz = secs.get(".modinfo")
-                  modinfo = bytearray(buf[off:off+sz])
-                  idx = modinfo.find(b"vermagic=")
-                  if idx != -1:
-                      end = modinfo.find(b"\0", idx)
-                      modinfo[idx:end] = b"\0" * (end - idx)
-                  new_modinfo = bytes(modinfo) + target_vermagic
+                  entries = [e for e in bytes(buf[off:off+sz]).split(b"\0") if e and not e.startswith(b"vermagic=")]
+                  new_modinfo = b"\0".join(entries) + b"\0" + target_vermagic
                   while len(buf) % 8 != 0:
                       buf.append(0)
                   new_off = len(buf)
@@ -165,7 +173,7 @@ jobs:
                   print(f"{fn}: patched {patched} CRCs")
               open(path, "wb").write(buf)
           PYEOF
-          modprobe --dump-modversions ko_out/ath.ko | grep -E "wiphy_apply_custom_regulatory|ieee80211_get_channel_khz|freq_reg_info"
+          modprobe --dump-modversions ko_out/ath.ko | grep -E "reg_initiator_name|wiphy_apply_custom_regulatory|ieee80211_get_channel_khz|freq_reg_info"
 
       - name: Upload compiled modules
         uses: actions/upload-artifact@v4
