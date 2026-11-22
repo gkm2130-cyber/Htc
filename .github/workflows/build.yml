@@ -200,9 +200,8 @@ jobs:
           PYEOF
           modprobe --dump-modversions ko_out/ath.ko | grep -E "reg_initiator_name|wiphy_apply_custom_regulatory|ieee80211_get_channel_khz|freq_reg_info"
 
-            - name: Upload compiled modules
+      - name: Upload compiled modules
         uses: actions/upload-artifact@v4
         with:
           name: ar9271-ko-modules
           path: ko_out/*.ko
-
