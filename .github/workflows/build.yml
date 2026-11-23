@@ -33,6 +33,7 @@ jobs:
         run: |
           cd kernel
           sed -i '/CONFIG_LEDS_TRIGGERS/d;/CONFIG_MAC80211_LEDS/d' common/arch/arm64/configs/gki_defconfig
+          sed -i '/select MAC80211_LEDS/d' common/drivers/net/wireless/ath/ath9k/Kconfig
           {
             echo 'CONFIG_CFG80211=m # nocheck'
             echo 'CONFIG_CFG80211_WEXT=y # nocheck'
@@ -72,103 +73,55 @@ jobs:
               e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", data, 58)
               shstr_off, = struct.unpack_from("<Q", data, e_shoff + e_shstrndx * e_shentsize + 24)
               secs = dict()
+              sec_list = list()
               for i in range(e_shnum):
                   off = e_shoff + i * e_shentsize
                   sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size = struct.unpack_from("<IIQQQQ", data, off)
                   name = read_cstr(data, shstr_off + sh_name)
-                  secs[name] = (off, sh_offset, sh_size, sh_addr)
-              return secs
+                  secs[name] = (off, sh_offset, sh_size)
+                  sec_list.append((sh_offset, sh_size))
+              return secs, sec_list
 
           def get_vermagic(ko_path):
               d = open(ko_path, "rb").read()
-              secs = parse_elf(d)
-              _, off, sz, _ = secs[".modinfo"]
+              secs, _ = parse_elf(d)
+              _, off, sz = secs[".modinfo"]
               modinfo = d[off:off+sz]
               idx = modinfo.find(b"vermagic=")
               assert idx != -1, f"vermagic not found in {ko_path}"
               end = modinfo.find(b"\0", idx)
               return modinfo[idx:end+1]
 
-          def prel31_to_addr(place_addr, val):
-              offset = ((val & 0x7fffffff) ^ 0x40000000) - 0x40000000
-              return place_addr + offset
-
           def read_vendor_sym_crcs(ko_path):
               d = open(ko_path, "rb").read()
-              secs = parse_elf(d)
+              secs, sec_list = parse_elf(d)
               crc_map = dict()
-
-              def read_u32_at_vaddr(vaddr):
-                  for _, s_off, s_sz, s_addr in secs.values():
-                      if s_addr <= vaddr <= s_addr + s_sz - 4:
-                          val, = struct.unpack_from("<I", d, s_off + (vaddr - s_addr))
-                          return val
-                  return None
-
-              symtab = list()
               if ".symtab" in secs and ".strtab" in secs:
-                  _, sym_off, sym_sz, _ = secs[".symtab"]
-                  _, str_off, _, _ = secs[".strtab"]
+                  _, sym_off, sym_sz = secs[".symtab"]
+                  _, str_off, _ = secs[".strtab"]
                   for pos in range(sym_off, sym_off + sym_sz, 24):
-                      st_name, st_info, st_other, st_shndx, st_value, st_size = struct.unpack_from("<IBBHQQ", d, pos)
-                      name = read_cstr(d, str_off + st_name) if st_name else ""
-                      symtab.append((st_shndx, st_value, name))
-                      if name.startswith("__crc_"):
-                          crc_map[name[6:]] = st_value & 0xffffffff
-
-              if "__ksymtab_strings" in secs:
-                  _, sstr_off, sstr_sz, sstr_addr = secs["__ksymtab_strings"]
-                  for ktab, ctab in [("__ksymtab", "__kcrctab"), ("__ksymtab_gpl", "__kcrctab_gpl")]:
-                      if ktab in secs and ctab in secs:
-                          _, koff, ksz, kaddr = secs[ktab]
-                          _, coff, csz, caddr = secs[ctab]
-                          num_entries = min(ksz // 12, csz // 4)
-                          for i in range(num_entries):
-                              entry_off = koff + i * 12
-                              entry_addr = kaddr + i * 12
-                              _, name_prel, _ = struct.unpack_from("<III", d, entry_off)
-                              target_addr = prel31_to_addr(entry_addr + 4, name_prel)
-                              str_off_in_sec = target_addr - sstr_addr
-                              if 0 <= str_off_in_sec < sstr_sz:
-                                  sym = read_cstr(d, sstr_off + str_off_in_sec)
-                                  raw_crc, = struct.unpack_from("<I", d, coff + i * 4)
-                                  crc_addr = prel31_to_addr(caddr + i * 4, raw_crc)
-                                  deref_crc = read_u32_at_vaddr(crc_addr)
-                                  crc = deref_crc if deref_crc is not None else raw_crc
-                                  if sym and sym.isidentifier():
-                                      crc_map[sym] = crc
-                  for rtab, ctab in [(".rela__ksymtab", "__kcrctab"), (".rela__ksymtab_gpl", "__kcrctab_gpl")]:
-                      if rtab in secs and ctab in secs and symtab:
-                          _, roff, rsz, _ = secs[rtab]
-                          _, coff, csz, _ = secs[ctab]
-                          for pos in range(roff, roff + rsz, 24):
-                              r_offset, r_info, r_addend = struct.unpack_from("<QQq", d, pos)
-                              if r_offset % 12 == 4:
-                                  idx = r_offset // 12
-                                  sym_idx = r_info >> 32
-                                  if idx * 4 + 4 <= csz and sym_idx < len(symtab):
-                                      _, st_val, _ = symtab[sym_idx]
-                                      str_pos = st_val + r_addend
-                                      if 0 <= str_pos < sstr_sz:
-                                          sym = read_cstr(d, sstr_off + str_pos)
-                                          crc, = struct.unpack_from("<I", d, coff + idx * 4)
-                                          if sym and sym.isidentifier():
-                                              crc_map[sym] = crc
+                      st_name, _, _, st_shndx, st_value, _ = struct.unpack_from("<IBBHQQ", d, pos)
+                      if st_name:
+                          name = read_cstr(d, str_off + st_name)
+                          if name.startswith("__crc_") and 0 < st_shndx < len(sec_list):
+                              s_off, s_sz = sec_list[st_shndx]
+                              if st_value + 4 <= s_sz:
+                                  crc, = struct.unpack_from("<I", d, s_off + st_value)
+                                  crc_map[name[6:]] = crc
               return crc_map
-
           target_vermagic = get_vermagic("cfg80211.ko")
           print("Auto-detected vermagic:", target_vermagic.decode().strip("\0"))
 
           vendor_crcs = dict()
           for vp in ["cfg80211.ko", "mac80211.ko"]:
               extracted = read_vendor_sym_crcs(vp)
-              print(f"{vp}: extracted {len(extracted)} symbol CRCs")
+              print(f"{vp}: extracted {len(extracted)} true CRCs")
               vendor_crcs.update(extracted)
 
           for check_sym in ["reg_initiator_name", "wiphy_apply_custom_regulatory", "ieee80211_get_channel_khz", "freq_reg_info"]:
               val = vendor_crcs.get(check_sym)
               print(f"Verify {check_sym}:", hex(val) if val is not None else "MISSING")
-              assert val is not None, f"Failed to extract CRC for {check_sym}"
+              assert val is not None and val > 0xffff, f"Failed to extract valid CRC for {check_sym}"
 
           targets = {"ath.ko", "ath9k_hw.ko", "ath9k_common.ko", "ath9k_htc.ko"}
 
@@ -178,10 +131,10 @@ jobs:
                   os.remove(path)
                   continue
               buf = bytearray(open(path, "rb").read())
-              secs = parse_elf(buf)
+              secs, _ = parse_elf(buf)
 
               if ".modinfo" in secs:
-                  hdr_off, off, sz, _ = secs[".modinfo"]
+                  hdr_off, off, sz = secs[".modinfo"]
                   entries = [e for e in bytes(buf[off:off+sz]).split(b"\0") if e and not e.startswith(b"vermagic=")]
                   new_modinfo = b"\0".join(entries) + b"\0" + target_vermagic
                   while len(buf) % 8 != 0:
@@ -192,16 +145,12 @@ jobs:
                   struct.pack_into("<Q", buf, hdr_off + 32, len(new_modinfo))
 
               if "__versions" in secs:
-                  _, off, sz, _ = secs["__versions"]
+                  _, off, sz = secs["__versions"]
                   patched = 0
                   for pos in range(off, off + sz, 64):
                       sym = read_cstr(bytes(buf[pos+8:pos+64]), 0)
                       if sym in vendor_crcs:
-                          old_crc, = struct.unpack_from("<Q", buf, pos)
-                          new_crc = vendor_crcs[sym]
-                          struct.pack_into("<Q", buf, pos, new_crc)
-                          if old_crc != new_crc:
-                              print(f"  {fn}: updated {sym} CRC {hex(old_crc)} -> {hex(new_crc)}")
+                          struct.pack_into("<Q", buf, pos, vendor_crcs[sym])
                           patched += 1
                   print(f"{fn}: patched {patched} CRCs")
               open(path, "wb").write(buf)
